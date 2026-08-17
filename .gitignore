@@ -1,0 +1,24 @@
+node_modules/
+
+# Downloaded PDFs and the chunks split out of them. Content-addressed and
+# regenerable from the CSV, and at corpus scale this is tens of gigabytes of other
+# people's documents — it does not belong in git.
+cache/
+
+# Run artifacts: one directory per document, holding status.json, log.jsonl,
+# diagnostics.json and output.html. These are the raw material of the analysis and
+# are worth keeping, but they are large and they contain the content of the
+# documents under test. Commit a summary, not the corpus.
+runs/
+results.jsonl
+summary.json
+prepared.jsonl
+corpus.jsonl
+
+# The URL list itself. Whether a given list is publishable is a decision for
+# whoever assembled it, so the default is not to.
+*.csv
+!example.csv
+
+.env
+.DS_Store
