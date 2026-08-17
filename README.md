@@ -1,4 +1,4 @@
-# iris-bench
+# equalify-iris-bench
 
 A benchmark harness for [Iris](https://github.com/EqualifyEverything/equalify-iris). Give it a
 CSV of PDF URLs; it tells you how often Iris succeeds, how long it takes, and what it costs
@@ -63,7 +63,7 @@ linter.
 ## Getting started
 
 ```sh
-git clone https://github.com/EqualifyEverything/iris-bench && cd iris-bench
+git clone https://github.com/EqualifyEverything/equalify-iris-bench && cd equalify-iris-bench
 npm install
 npm test                        # proves the harness works: no token, no network, no deployment
 ```

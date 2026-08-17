@@ -1,5 +1,5 @@
 {
-  "name": "iris-bench",
+  "name": "equalify-iris-bench",
   "version": "0.1.0",
   "private": true,
   "description": "Corpus-scale benchmark harness for Iris: success rate, latency and cost over a large list of real-world PDF URLs.",

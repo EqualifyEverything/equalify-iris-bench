@@ -1,7 +1,7 @@
 // A stand-in for the Iris API surface this harness uses, plus a PDF generator, so
 // all three stages can be exercised without a token, a network, or a live
 // deployment's queue. It is not a model of Iris — it is a fixture whose shapes match
-// the endpoints and log events iris-bench reads, which is what the harness can
+// the endpoints and log events this harness reads, which is what the harness can
 // actually get wrong.
 //
 // Its `max_pages` is deliberately tiny (3) so that splitting, the most intricate

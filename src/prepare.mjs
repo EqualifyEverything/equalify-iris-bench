@@ -23,7 +23,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { fetchLimits, pxFromPts, RASTER_DPI } from "./limits.mjs";
 import { appendJsonl, args, ensureDir, exec, hasCommand, log, num, pool, readJsonl, sha256 } from "./util.mjs";
 
-const UA = "iris-bench/0.1 (+https://github.com/EqualifyEverything/iris-bench)";
+const UA = "equalify-iris-bench/0.1 (+https://github.com/EqualifyEverything/equalify-iris-bench)";
 
 // A ceiling on the download itself, not on what Iris accepts. Its purpose is to
 // stop one pathological 400 MB scan from filling the disk; anything over it is

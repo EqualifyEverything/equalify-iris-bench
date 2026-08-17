@@ -369,7 +369,7 @@ const rate = (v) => (v == null ? "n/a" : `${(v * 100).toFixed(1)}%`);
 
 function print(s) {
   const l = log;
-  l("=== iris-bench ===");
+  l("=== equalify-iris-bench ===");
   l(`corpus: ${s.corpus.submitted} item(s) submitted from ${s.corpus.urls_submitted} of`,
     `${s.corpus.urls_prepared ?? "?"} prepared URL(s) — ${s.corpus.pages_delivered} page(s) delivered,`,
     `${s.corpus.chunks} item(s) were chunks of oversize PDFs`);

@@ -41,7 +41,7 @@ const jsonl = (p) =>
 test("prepare, run and report over a stub deployment", async (t) => {
   const { base, origin, server } = await startStub({ pages: 7, failNth: 3 });
   t.after(() => server.close());
-  const dir = mkdtempSync(join(tmpdir(), "iris-bench-"));
+  const dir = mkdtempSync(join(tmpdir(), "equalify-iris-bench-"));
   const env = { IRIS_BASE_URL: base, IRIS_TOKEN: "stub-token" };
 
   writeFileSync(
@@ -173,7 +173,7 @@ test("a refused token stops the campaign instead of consuming it", async (t) => 
   // minute — and recovering would mean re-running the whole corpus.
   const { base, origin, server } = await startStub({ pages: 7, unauthorizedAfter: 1 });
   t.after(() => server.close());
-  const dir = mkdtempSync(join(tmpdir(), "iris-bench-auth-"));
+  const dir = mkdtempSync(join(tmpdir(), "equalify-iris-bench-auth-"));
   const env = { IRIS_BASE_URL: base, IRIS_TOKEN: "expired-token" };
 
   writeFileSync(join(dir, "urls.csv"), `pdf_url\n${origin}/a.pdf\n`);
