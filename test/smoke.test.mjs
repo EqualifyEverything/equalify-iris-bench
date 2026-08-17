@@ -167,6 +167,33 @@ test("prepare, run and report over a stub deployment", async (t) => {
   assert.match(failedRow.error, /stream stalled/);
 });
 
+test("a refused token stops the campaign instead of consuming it", async (t) => {
+  // The multi-day hazard: a GitHub user token can expire mid-run. Without this, every
+  // remaining item would be submitted, refused, and ledgered as a failure in about a
+  // minute — and recovering would mean re-running the whole corpus.
+  const { base, origin, server } = await startStub({ pages: 7, unauthorizedAfter: 1 });
+  t.after(() => server.close());
+  const dir = mkdtempSync(join(tmpdir(), "iris-bench-auth-"));
+  const env = { IRIS_BASE_URL: base, IRIS_TOKEN: "expired-token" };
+
+  writeFileSync(join(dir, "urls.csv"), `pdf_url\n${origin}/a.pdf\n`);
+  assert.equal((await run("prepare.mjs", ["--csv", "urls.csv"], env, dir)).code, 0);
+  assert.equal(jsonl(join(dir, "corpus.jsonl")).length, 3, "three chunks, of which only one is accepted");
+
+  const ran = await run("run.mjs", ["--poll-ms", "50", "--concurrency", "1"], env, dir);
+  assert.equal(ran.code, 1, "a refused token is a non-zero exit, not a quiet finish");
+  assert.match(ran.stderr, /STOPPED: http_401/);
+  assert.match(ran.stderr, /not attempted and are not in the ledger/);
+  assert.match(ran.stderr, /login\.mjs/, "says how to recover");
+
+  // Only the item that actually ran is ledgered, so a fresh token resumes at the
+  // exact point the old one stopped being accepted.
+  assert.deepEqual(
+    jsonl(join(dir, "runs", "ledger.jsonl")).map((r) => r.outcome),
+    ["ready_for_review"],
+  );
+});
+
 test("an unpriced model yields no dollars and says so", async () => {
   const { costOf } = await import("../src/pricing.mjs");
   const tokens = { input: 1000, output: 1000, cache_read: 0, cache_write: 0 };

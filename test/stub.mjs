@@ -112,7 +112,9 @@ const diagnostics = (id, failed) => ({
 
 // `failNth` makes one submission end in `status: "failed"`, so the test covers the
 // capture path that matters most: a run whose only account of itself is its log.
-export function startStub({ pages = 7, failNth = 3 } = {}) {
+// `unauthorizedAfter` starts refusing submissions partway through, which is what an
+// expiring GitHub user token looks like to a campaign that outlives it.
+export function startStub({ pages = 7, failNth = 3, unauthorizedAfter = Infinity } = {}) {
   const pdf = makePdf(pages);
   const sessions = new Map();
   let submissions = 0;
@@ -134,6 +136,9 @@ export function startStub({ pages = 7, failNth = 3 } = {}) {
     if (path === "/v1/sessions" && req.method === "POST") {
       for await (const chunk of req) void chunk; // drain the multipart body
       submissions += 1;
+      if (submissions > unauthorizedAfter) {
+        return send(401, { error: "unauthorized", message: "Bad credentials" });
+      }
       const id = `sess-${submissions}`;
       sessions.set(id, { polls: 0, failed: submissions === failNth });
       return send(200, { session_id: id, status: "queued" });

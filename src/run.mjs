@@ -192,7 +192,7 @@ async function main() {
   const base = process.env.IRIS_BASE_URL ?? "https://iris.equalify.uic.edu/v1";
   const token = process.env.IRIS_TOKEN;
   if (!token) {
-    console.error("IRIS_TOKEN is not set (a GitHub token — see `iris login` or docs/API.md §1).");
+    console.error("IRIS_TOKEN is not set. Get one with: node src/login.mjs   (GitHub device flow)");
     process.exit(2);
   }
   const corpusPath = a.corpus ?? "corpus.jsonl";
@@ -233,12 +233,24 @@ async function main() {
 
   const counts = {};
   let n = 0;
+  // A rejected credential stops the campaign instead of consuming it. Tokens are
+  // GitHub user tokens and can expire mid-run — a multi-day campaign is longer than
+  // some tokens live — and without this the remaining 1900 items would each be
+  // submitted, refused, and written to the ledger as failures in about a minute,
+  // needing --redo to recover. Nothing is ledgered for an auth failure, so a fresh
+  // token resumes exactly where the old one stopped being accepted.
+  let abort = null;
   await pool(todo, opts.concurrency, async (doc) => {
+    if (abort) return;
     let meta;
     try {
       meta = await runOne(client, doc, opts);
     } catch (e) {
       meta = { id: doc.id, url: doc.url, outcome: "harness_error", error: `${e.name}: ${e.message}` };
+    }
+    if (meta.outcome === "http_401" || meta.outcome === "http_403") {
+      abort ??= `${meta.outcome} on submit — the token was refused: ${String(meta.error).slice(0, 200)}`;
+      return;
     }
     appendJsonl(ledgerPath, {
       id: meta.id,
@@ -261,6 +273,13 @@ async function main() {
 
   log("--- outcomes ---");
   for (const [k, v] of Object.entries(counts).sort((x, y) => y[1] - x[1])) log(`  ${k}: ${v}`);
+  if (abort) {
+    log(`STOPPED: ${abort}`);
+    log(`  ${todo.length - n} item(s) were not attempted and are not in the ledger.`);
+    log("  Get a fresh token (node src/login.mjs) and run again to continue.");
+    log(`artifacts so far in ${out}/`);
+    process.exit(1);
+  }
   log(`artifacts in ${out}/ — next: node src/report.mjs --runs ${out}`);
 }
 

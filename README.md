@@ -56,13 +56,37 @@ linter.
 - `qpdf` (strongly recommended): `brew install qpdf` / `apt install qpdf`. Without it, PDFs
   over the deployment's page cap cannot be split, which drops long documents from the corpus
   and biases every result toward short ones. `pdfseparate` + `pdfunite` are used as a fallback.
-- A GitHub token the target deployment accepts. `cp .env.example .env`, fill in `IRIS_TOKEN`,
-  and run with `node --env-file=.env ...`.
+- A GitHub token the target deployment accepts. Iris has no API keys and no anonymous mode —
+  the token is the identity that a session's feedback is filed under. `src/login.mjs` runs the
+  device flow for you.
+
+## Getting started
 
 ```sh
+git clone https://github.com/EqualifyEverything/iris-bench && cd iris-bench
 npm install
-npm test   # no token, no network, no live deployment needed
+npm test                        # proves the harness works: no token, no network, no deployment
 ```
+
+```sh
+cp .env.example .env            # then set IRIS_BASE_URL if not the UIC deployment
+node src/login.mjs              # opens a code to approve in the browser; prints a token
+                                # paste it into .env as IRIS_TOKEN
+```
+
+Start with a handful of URLs, not the whole list. Ten is enough to prove the loop end to end
+and to learn what a document costs:
+
+```sh
+printf 'pdf_url\nhttps://example.org/a.pdf\nhttps://example.org/b.pdf\n' > small.csv
+node --env-file=.env src/prepare.mjs --csv small.csv
+node --env-file=.env src/run.mjs
+node src/report.mjs
+```
+
+The report's `usd_per_page` and `ms_per_page` from that first handful are what size everything
+after it: multiply by the corpus's page count for the bill, and by `pages ÷ 2` for the wall
+clock at the deployment's current concurrency.
 
 ## Usage
 
@@ -83,6 +107,11 @@ node src/report.mjs
 node --env-file=.env src/run.mjs --limit 200
 node --env-file=.env src/run.mjs
 ```
+
+Tokens are GitHub user tokens and can expire before a multi-day campaign finishes. A refused
+token **stops** the run rather than failing the rest of the corpus against it, and nothing is
+written to the ledger for the items it never attempted — so `node src/login.mjs` and the same
+`run.mjs` command resume from exactly where the old token stopped being accepted.
 
 ### Stage 1 — `prepare.mjs`
 
