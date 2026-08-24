@@ -143,7 +143,16 @@ announce itself reads as "we covered everything".
 | `--stall-sec` | 45 | give up after this long with **no bytes at all** |
 | `--total-sec` | 1800 | backstop for a server that dribbles forever |
 | `--retry` | | re-attempt URLs that failed the *fetch* (see below) |
+| `--splitter` | qpdf if installed | force `qpdf` or `poppler` (see below) |
 | `--limit` | | prepare only the first N new URLs |
+
+**Install qpdf.** Both splitters work, but they are not interchangeable: `pdfseparate` +
+`pdfunite` copies the source's entire shared resource set into every slice, so a 25-page cut
+of the 1,004-page Texas appropriations act came out at **477 MB** from a 34 MB source. qpdf
+subsets properly. Every chunk is measured against the deployment's `max_request_bytes` before
+it can be submitted and recorded as `chunk_too_large` if it doesn't fit — per chunk, so the
+pages that did fit still run — and then deleted, since its size is the only useful thing about
+it. That class is retryable, because the fix is on this side.
 
 **Slow is not failed.** Document servers are slow — 35 MB at 40 KB/s is a fifteen-minute
 download that is working perfectly — so the stall clock is what detects failure, and it is

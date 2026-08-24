@@ -13,7 +13,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -255,13 +255,19 @@ test("a chunk too big to send is caught here, not by a 413", async (t) => {
   // copies the whole shared resource set into every slice. Each was uploaded and
   // refused with a 413. A chunk's size is not a function of its page count, so it has
   // to be measured — and measured here, where it costs a stat call.
-  const { base, origin, server } = await startStub({ pages: 7, maxRequestBytes: 900 });
+  // 1500 sits between poppler's 3-page slices (1921 and 2283 bytes) and its 1-page one
+  // (1023), so two of three chunks are unsendable and one is not — the shape the real
+  // Texas act took, in miniature.
+  const { base, origin, server } = await startStub({ pages: 7, maxRequestBytes: 1500 });
   t.after(() => server.close());
   const dir = mkdtempSync(join(tmpdir(), "equalify-iris-bench-big-"));
   const env = { IRIS_BASE_URL: base, IRIS_TOKEN: "stub-token" };
   writeFileSync(join(dir, "urls.csv"), `pdf_url\n${origin}/a.pdf\n`);
 
-  const prep = await run("prepare.mjs", ["--csv", "urls.csv"], env, dir);
+  // Forced to poppler, because poppler is the splitter that produces unsendable chunks
+  // and leaks scratch space — on a machine with qpdf installed, the default would test
+  // neither. It is the fixture for both, so both are asserted below.
+  const prep = await run("prepare.mjs", ["--csv", "urls.csv", "--splitter", "poppler"], env, dir);
   assert.equal(prep.code, 0, prep.stderr);
 
   // Per chunk, not per document: the two 3-page slices exceed the cap and the trailing
@@ -270,16 +276,11 @@ test("a chunk too big to send is caught here, not by a 413", async (t) => {
   const rows = jsonl(join(dir, "prepared.jsonl"));
   const big = rows.filter((r) => r.klass === "chunk_too_large");
   assert.equal(big.length, 2);
-  assert.ok(big[0].bytes > 900, "the measured size is kept, not just the verdict");
+  assert.ok(big[0].bytes > 1500, "the measured size is kept, not just the verdict");
   assert.match(big[0].error, /max_request_bytes/);
   assert.match(big[0].error, /\d+ bytes >/, "the sizes are readable, not rounded to '0.0 MB'");
-  // The qpdf advice is only true when poppler did the splitting, so it is asserted
-  // against whichever splitter this machine actually has.
-  if (big[0].split_with === "qpdf") {
-    assert.doesNotMatch(big[0].error, /install qpdf/, "no advice to install what is already in use");
-  } else {
-    assert.match(big[0].error, /install qpdf/, "says the fix, since the splitter is the cause");
-  }
+  assert.equal(big[0].split_with, "poppler", "--splitter was honoured, so the advice below is the right advice");
+  assert.match(big[0].error, /install qpdf/, "says the fix, since the splitter is the cause");
   assert.deepEqual(
     big.map((r) => [r.page_from, r.page_to]),
     [
@@ -287,6 +288,18 @@ test("a chunk too big to send is caught here, not by a 413", async (t) => {
       [4, 6],
     ],
     "and exactly which pages are missing as a result",
+  );
+
+  // A chunk that can never be sent is not kept. The four real ones were 477 MB each,
+  // and its measured size — the part worth having — is in the record above.
+  for (const r of big) assert.ok(!existsSync(join(dir, "cache", "chunks", `${r.id}.pdf`)), `${r.id} was removed`);
+
+  // Nor is the scratch space poppler splits into: one file per page, per chunk, per
+  // document. Left behind, four documents cost 3.3 GB in .tmp dirs alone.
+  assert.deepEqual(
+    readdirSync(join(dir, "cache", "chunks")).filter((f) => f.startsWith(".tmp-")),
+    [],
+    "the splitter's scratch directories are cleaned up",
   );
 
   // Not runnable, and not silently absent either: the parent counts them and the

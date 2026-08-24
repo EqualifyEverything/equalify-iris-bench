@@ -19,7 +19,7 @@
 // skipped on a later pass, and downloads are content-addressed in cache/.
 
 import { join, resolve } from "node:path";
-import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { fetchLimits, pxFromPts, RASTER_DPI } from "./limits.mjs";
 import {
   appendJsonl,
@@ -287,10 +287,15 @@ async function inspect(path, maxPages) {
 
 // qpdf if it is here, poppler otherwise. Both are ordinary installs and either
 // will do; what matters is not silently declining to split, since that would
-// re-introduce the long-document bias splitting exists to remove.
-async function splitter() {
-  if (await hasCommand("qpdf")) return "qpdf";
-  if ((await hasCommand("pdfseparate")) && (await hasCommand("pdfunite"))) return "poppler";
+// re-introduce the long-document bias splitting exists to remove. They are not
+// equivalent, though — poppler's output can be an order of magnitude larger — so
+// --splitter forces one, which is how the poppler path stays tested on a machine
+// that has qpdf.
+async function splitter(prefer) {
+  const have = { qpdf: await hasCommand("qpdf"), poppler: (await hasCommand("pdfseparate")) && (await hasCommand("pdfunite")) };
+  if (prefer) return have[prefer] ? prefer : null;
+  if (have.qpdf) return "qpdf";
+  if (have.poppler) return "poppler";
   return null;
 }
 
@@ -340,7 +345,8 @@ async function main() {
     console.error(
       "usage: node src/prepare.mjs --csv urls.csv [--out .] [--concurrency 8]\n" +
         `                           [--max-download-mb ${DEFAULT_MAX_DOWNLOAD_MB}] [--max-chunks ${DEFAULT_MAX_CHUNKS}] [--limit N]\n` +
-        `                           [--stall-sec ${DEFAULT_STALL_SEC}] [--total-sec ${DEFAULT_TOTAL_SEC}] [--retry]`,
+        `                           [--stall-sec ${DEFAULT_STALL_SEC}] [--total-sec ${DEFAULT_TOTAL_SEC}] [--retry]\n` +
+        `                           [--splitter qpdf|poppler]`,
     );
     process.exit(2);
   }
@@ -367,7 +373,16 @@ async function main() {
     process.exit(2);
   }
   const limits = await fetchLimits(base);
-  const tool = await splitter();
+  const prefer = a.splitter === true ? null : a.splitter;
+  if (prefer && !["qpdf", "poppler"].includes(prefer)) {
+    console.error(`--splitter must be qpdf or poppler, not ${prefer}`);
+    process.exit(2);
+  }
+  const tool = await splitter(prefer);
+  if (!tool && prefer) {
+    console.error(`--splitter ${prefer} was asked for and is not installed.`);
+    process.exit(2);
+  }
   if (!tool) {
     log("WARNING: neither qpdf nor pdfseparate+pdfunite found — oversize PDFs will be recorded, not split.");
     log("         That drops long documents from the corpus and biases it toward short ones. Install qpdf.");
@@ -469,11 +484,19 @@ async function main() {
         const to = Math.min(info.pages, from + limits.maxPages - 1);
         const id = `${sha}-p${from}-${to}`;
         const dest = join(chunkDir, `${id}.pdf`);
-        const tmp = ensureDir(join(chunkDir, `.tmp-${id}`));
+        // Only poppler needs scratch space, and it needs it deleted: it writes one file
+        // per page before uniting them, so a document left behind costs more on disk
+        // than the chunk it produced. Four documents leaked 3.3 GB this way.
+        const tmp = tool === "poppler" ? ensureDir(join(chunkDir, `.tmp-${id}`)) : null;
         // A retried URL re-splits from scratch. Skipping existing chunks makes an
         // ordinary resume cheap, but on a retry the existing chunks are precisely what
         // is suspect — they may be the output of a splitter that has since been fixed.
-        const err = existsSync(dest) && !isRetry ? null : await splitRange(tool, path, from, to, dest, tmp);
+        let err = null;
+        try {
+          if (isRetry || !existsSync(dest)) err = await splitRange(tool, path, from, to, dest, tmp);
+        } finally {
+          if (tmp) rmSync(tmp, { recursive: true, force: true });
+        }
         if (err) {
           failure = err;
           break;
@@ -486,12 +509,14 @@ async function main() {
         const bytes = statSync(dest).size;
         if (limits.maxRequestBytes && bytes > limits.maxRequestBytes) {
           tooLarge++;
+          // Deleted, not kept: it can never be sent, and four of these were 477 MB
+          // each. The measured size below is the part worth keeping.
+          rmSync(dest, { force: true });
           appendJsonl(preparedPath, {
             url,
             prepared_at: record.prepared_at,
             klass: "chunk_too_large",
             id,
-            path: dest,
             sha256: sha,
             parent_sha: sha,
             page_from: from,
