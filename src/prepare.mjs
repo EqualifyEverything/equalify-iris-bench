@@ -21,7 +21,19 @@
 import { join, resolve } from "node:path";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { fetchLimits, pxFromPts, RASTER_DPI } from "./limits.mjs";
-import { appendJsonl, args, ensureDir, exec, hasCommand, log, num, pool, readJsonl, sha256 } from "./util.mjs";
+import {
+  appendJsonl,
+  args,
+  ensureDir,
+  exec,
+  hasCommand,
+  latestAttempts,
+  log,
+  num,
+  pool,
+  readJsonl,
+  sha256,
+} from "./util.mjs";
 
 const UA = "equalify-iris-bench/0.1 (+https://github.com/EqualifyEverything/equalify-iris-bench)";
 
@@ -35,6 +47,19 @@ const DEFAULT_MAX_DOWNLOAD_MB = 200;
 // dropped tail is recorded on the parent and logged in the summary — a bound that
 // does not announce itself reads as "we covered everything".
 const DEFAULT_MAX_CHUNKS = 4;
+
+// Two separate clocks, because "slow" and "hung" are different failures and one
+// deadline cannot tell them apart. A flat deadline set short enough to notice a hung
+// connection also discards every large PDF on a slow host — and government document
+// servers, which are most of what a corpus like this points at, are exactly that:
+// 35 MB at 40 KB/s is a fifteen-minute download that is working perfectly. Measured
+// against these four URLs, a 120s flat deadline dropped three of them, and the corpus
+// that survived would have been silently biased toward small files on fast hosts.
+//
+// So: STALL is the real failure detector — no bytes at all for this long. TOTAL is
+// only a backstop against a server that dribbles forever.
+const DEFAULT_STALL_SEC = 45;
+const DEFAULT_TOTAL_SEC = 30 * 60;
 
 // --- CSV -------------------------------------------------------------------
 
@@ -111,31 +136,103 @@ function pickUrls(rows) {
 
 // --- download + inspect ----------------------------------------------------
 
-async function download(url, maxBytes) {
+// A TLS chain that Node rejects and a browser accepts. Real: www.hr.uic.edu serves an
+// incomplete chain, and browsers paper over it by fetching the missing intermediate
+// while Node does not. Worth its own class rather than hiding inside download_failed,
+// because the fix is a trust-store flag (see --use-system-ca in the README) rather than
+// anything wrong with the URL.
+const TLS_CODES = new Set([
+  "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+  "UNABLE_TO_GET_ISSUER_CERT",
+  "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+  "SELF_SIGNED_CERT_IN_CHAIN",
+  "DEPTH_ZERO_SELF_SIGNED_CERT",
+  "CERT_HAS_EXPIRED",
+  "ERR_TLS_CERT_ALTNAME_INVALID",
+  "HOSTNAME_MISMATCH",
+]);
+
+function downloadError(e, { stalled, expired, stallSec, totalSec, got }) {
+  if (stalled) {
+    return { klass: "download_stalled", error: `no bytes for ${stallSec}s after ${got} byte(s)`, bytes: got };
+  }
+  if (expired) {
+    return { klass: "download_timeout", error: `still downloading after ${totalSec}s (${got} byte(s))`, bytes: got };
+  }
+  const code = e?.cause?.code ?? e?.code;
+  const cause = e?.cause?.message ?? e?.message;
+  if (TLS_CODES.has(code) || /certificate/i.test(cause ?? "")) {
+    return { klass: "tls_failed", error: `${code ?? "tls"}: ${cause}`.slice(0, 300) };
+  }
+  return { klass: "download_failed", error: `${e.name}: ${e.message}${cause && cause !== e.message ? ` (${cause})` : ""}`.slice(0, 300) };
+}
+
+async function download(url, maxBytes, { stallSec = DEFAULT_STALL_SEC, totalSec = DEFAULT_TOTAL_SEC } = {}) {
+  const ctl = new AbortController();
+  let stalled = false;
+  let expired = false;
+  let got = 0;
+  let stallTimer;
+  // Re-armed on every chunk, so progress — however slow — is never a failure.
+  const arm = () => {
+    clearTimeout(stallTimer);
+    stallTimer = setTimeout(() => {
+      stalled = true;
+      ctl.abort();
+    }, stallSec * 1000);
+  };
+  const totalTimer = setTimeout(() => {
+    expired = true;
+    ctl.abort();
+  }, totalSec * 1000);
+  const stop = () => {
+    clearTimeout(stallTimer);
+    clearTimeout(totalTimer);
+  };
+  const failed = (e) => downloadError(e, { stalled, expired, stallSec, totalSec, got });
+
   let res;
   try {
+    arm();
     res = await fetch(url, {
       redirect: "follow",
-      signal: AbortSignal.timeout(120_000),
+      signal: ctl.signal,
       headers: { "user-agent": UA, accept: "application/pdf,*/*" },
     });
   } catch (e) {
-    return { klass: "download_failed", error: `${e.name}: ${e.message}` };
+    stop();
+    return failed(e);
   }
-  if (!res.ok) return { klass: "download_failed", error: `http_${res.status}`, http_status: res.status };
+  if (!res.ok) {
+    stop();
+    return { klass: "download_failed", error: `http_${res.status}`, http_status: res.status };
+  }
 
   const declared = Number(res.headers.get("content-length") ?? 0);
   if (declared && declared > maxBytes) {
+    stop();
     return { klass: "too_large_bytes", error: `content-length ${declared} > ${maxBytes}`, bytes: declared };
   }
+
+  // Streamed rather than buffered whole, so a file that lies about its content-length
+  // is stopped at the cap instead of after it has been held in memory.
+  const parts = [];
   let buf;
   try {
-    buf = Buffer.from(await res.arrayBuffer());
+    for await (const chunk of res.body) {
+      arm();
+      got += chunk.length;
+      if (got > maxBytes) {
+        stop();
+        return { klass: "too_large_bytes", error: `over ${maxBytes} bytes (undeclared)`, bytes: got };
+      }
+      parts.push(Buffer.from(chunk));
+    }
+    buf = Buffer.concat(parts);
   } catch (e) {
-    return { klass: "download_failed", error: `body: ${e.message}` };
-  }
-  if (buf.length > maxBytes) {
-    return { klass: "too_large_bytes", error: `${buf.length} bytes > ${maxBytes}`, bytes: buf.length };
+    return failed(e);
+  } finally {
+    stop();
   }
   // Magic bytes, not content-type. A great many servers hand out PDFs as
   // application/octet-stream, and a great many hand out an HTML "sign in" page as
@@ -216,6 +313,14 @@ async function splitRange(tool, src, from, to, dest, tmpDir) {
   return uni.code === 0 ? null : uni.stderr.trim().slice(0, 300);
 }
 
+// --- accounting ------------------------------------------------------------
+
+// Classes that say something about the fetch rather than about the document. Each is
+// recoverable by changing a setting — a longer stall budget, a wider trust store, a
+// working network — so `--retry` re-attempts exactly these and leaves settled verdicts
+// (not_pdf, encrypted, duplicate, too_large_bytes, ok) alone.
+const RETRYABLE = new Set(["download_failed", "download_stalled", "download_timeout", "tls_failed", "prepare_error"]);
+
 // --- main ------------------------------------------------------------------
 
 async function main() {
@@ -223,7 +328,8 @@ async function main() {
   if (!a.csv) {
     console.error(
       "usage: node src/prepare.mjs --csv urls.csv [--out .] [--concurrency 8]\n" +
-        `                           [--max-download-mb ${DEFAULT_MAX_DOWNLOAD_MB}] [--max-chunks ${DEFAULT_MAX_CHUNKS}] [--limit N]`,
+        `                           [--max-download-mb ${DEFAULT_MAX_DOWNLOAD_MB}] [--max-chunks ${DEFAULT_MAX_CHUNKS}] [--limit N]\n` +
+        `                           [--stall-sec ${DEFAULT_STALL_SEC}] [--total-sec ${DEFAULT_TOTAL_SEC}] [--retry]`,
     );
     process.exit(2);
   }
@@ -240,6 +346,10 @@ async function main() {
   const maxBytes = num(a["max-download-mb"], DEFAULT_MAX_DOWNLOAD_MB) * 1024 * 1024;
   const maxChunks = num(a["max-chunks"], DEFAULT_MAX_CHUNKS);
   const concurrency = num(a.concurrency, 8);
+  const timeouts = {
+    stallSec: num(a["stall-sec"], DEFAULT_STALL_SEC),
+    totalSec: num(a["total-sec"], DEFAULT_TOTAL_SEC),
+  };
 
   if (!(await hasCommand("pdfinfo"))) {
     console.error("pdfinfo not found. Install poppler-utils (brew install poppler / apt install poppler-utils).");
@@ -253,21 +363,28 @@ async function main() {
   }
 
   const { urls } = pickUrls(parseCsv(readFileSync(a.csv, "utf8")));
-  const done = new Map(readJsonl(preparedPath).map((r) => [r.url, r]));
-  let todo = urls.filter((u) => !done.has(u));
+  const previous = latestAttempts(readJsonl(preparedPath));
+  // The URL-level outcome of each past attempt — chunk children carry their parent's
+  // URL, so they are not it.
+  const done = new Map(previous.filter((r) => !r.parent_sha).map((r) => [r.url, r]));
+  const retryable = urls.filter((u) => RETRYABLE.has(done.get(u)?.klass));
+  let todo = urls.filter((u) => !done.has(u) || (a.retry && RETRYABLE.has(done.get(u).klass)));
   if (a.limit) todo = todo.slice(0, num(a.limit, todo.length));
   log(`csv: ${urls.length} unique URL(s); ${done.size} already prepared; ${todo.length} to fetch`);
+  if (retryable.length && !a.retry) {
+    log(`  ${retryable.length} previously failed on the fetch, not on the document — --retry re-attempts those`);
+  }
 
   // sha256 -> url, so the same file behind two URLs is downloaded twice (cheap,
   // and unavoidable without fetching) but run once.
   const bySha = new Map();
-  for (const r of done.values()) if (r.sha256 && !r.duplicate_of) bySha.set(r.sha256, r.url);
+  for (const r of previous) if (r.sha256 && !r.duplicate_of && !todo.includes(r.url)) bySha.set(r.sha256, r.url);
 
   let n = 0;
   await pool(todo, concurrency, async (url) => {
     const record = { url, prepared_at: new Date().toISOString() };
     try {
-      const dl = await download(url, maxBytes);
+      const dl = await download(url, maxBytes, timeouts);
       if (dl.klass) {
         appendJsonl(preparedPath, { ...record, ...dl });
         return;
@@ -371,7 +488,7 @@ async function main() {
 
   // corpus.jsonl is the runnable subset, rewritten from scratch each pass so it is
   // a deterministic function of prepared.jsonl rather than an append-only history.
-  const all = readJsonl(preparedPath);
+  const all = latestAttempts(readJsonl(preparedPath));
   const runnable = all.filter((r) => r.klass === "ok");
   runnable.sort((x, y) => (x.id < y.id ? -1 : x.id > y.id ? 1 : 0)); // stable staging order
   writeFileSync(corpusPath, runnable.map((r) => JSON.stringify(r)).join("\n") + (runnable.length ? "\n" : ""));
@@ -388,6 +505,19 @@ async function main() {
   log(`  runnable: ${runnable.length} session(s), ${pages} page(s) — ${chunked} of them chunks of oversize PDFs`);
   if (droppedChunks) log(`  NOT covered: ${droppedChunks} chunk(s) past --max-chunks=${maxChunks}`);
   if (atRisk) log(`  ${atRisk} runnable item(s) carry a predicted-rejection risk flag (see .risks)`);
+  // These three are recoverable by re-running with different settings, and a corpus
+  // that lost documents to a trust store or a slow host is not the corpus that was
+  // asked for — so they are called out rather than left to be read off a class tally.
+  if (counts.tls_failed) {
+    log(`  ${counts.tls_failed} URL(s) failed TLS verification — hosts serving an incomplete chain.`);
+    log("     Retry those with: node --use-system-ca src/prepare.mjs ... (widens trust to the OS store)");
+  }
+  if (counts.download_stalled || counts.download_timeout) {
+    log(
+      `  ${(counts.download_stalled ?? 0) + (counts.download_timeout ?? 0)} URL(s) ran out of download time` +
+        ` (--stall-sec ${timeouts.stallSec}, --total-sec ${timeouts.totalSec}) — raise either and re-run to retry them.`,
+    );
+  }
   log(`wrote ${corpusPath}`);
 }
 

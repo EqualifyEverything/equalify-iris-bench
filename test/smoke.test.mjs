@@ -194,6 +194,61 @@ test("a refused token stops the campaign instead of consuming it", async (t) => 
   );
 });
 
+test("a slow host is not a failed host, and a hung one is retryable", async (t) => {
+  // Measured on the first real four-URL bench: a flat 120s download deadline dropped
+  // three of the four, all of them working PDFs on slow government hosts. So progress
+  // — however slow — must never be a failure, silence must be, and the difference has
+  // to survive into the corpus as a class you can retry.
+  const { base, origin, server } = await startStub({ pages: 7 });
+  t.after(() => server.close());
+  const dir = mkdtempSync(join(tmpdir(), "equalify-iris-bench-slow-"));
+  const env = { IRIS_BASE_URL: base, IRIS_TOKEN: "stub-token" };
+
+  writeFileSync(
+    join(dir, "urls.csv"),
+    ["pdf_url", `${origin}/dribble.pdf`, `${origin}/stall.pdf`, `${origin}/flaky.pdf`, ""].join("\n"),
+  );
+
+  // A 1s stall budget with a 60s total: the dribbled file takes ~1.25s in five 250ms
+  // steps, so it only survives if the clock is re-armed per chunk rather than run once.
+  const first = await run(
+    "prepare.mjs",
+    ["--csv", "urls.csv", "--stall-sec", "1", "--total-sec", "60", "--concurrency", "3"],
+    env,
+    dir,
+  );
+  assert.equal(first.code, 0, first.stderr);
+  // findLast, not find: prepared.jsonl keeps every attempt, and the latest is the verdict.
+  const klassOf = (u) =>
+    jsonl(join(dir, "prepared.jsonl")).findLast((r) => r.url.endsWith(u) && !r.parent_sha)?.klass;
+  assert.equal(klassOf("/dribble.pdf"), "ok", "slow but progressing is a document, not a failure");
+  assert.equal(klassOf("/stall.pdf"), "download_stalled");
+  assert.equal(klassOf("/flaky.pdf"), "download_stalled");
+  assert.match(first.stderr, /ran out of download time/);
+
+  // Without --retry a fetch failure is sticky, and says how to un-stick it.
+  const second = await run("prepare.mjs", ["--csv", "urls.csv"], env, dir);
+  assert.match(second.stderr, /2 previously failed on the fetch, not on the document/);
+  assert.match(second.stderr, /0 to fetch/);
+
+  // With it, only the fetch failures are re-attempted — the settled `ok` is not
+  // re-downloaded — and the host that works the second time becomes a document.
+  const third = await run("prepare.mjs", ["--csv", "urls.csv", "--retry", "--stall-sec", "1"], env, dir);
+  assert.match(third.stderr, /2 to fetch/);
+  assert.equal(klassOf("/flaky.pdf"), "ok");
+  assert.equal(klassOf("/stall.pdf"), "download_stalled", "still hung, still recorded");
+
+  // The retried URL is counted once, not once per attempt: prepared.jsonl keeps both
+  // attempts, so a tally over raw rows would report 4 outcomes for 3 URLs.
+  const rows = jsonl(join(dir, "prepared.jsonl")).filter((r) => !r.parent_sha);
+  assert.equal(rows.length, 5, "three first attempts plus two retries are all on disk");
+  const summary = third.stderr.slice(third.stderr.indexOf("--- corpus ---"));
+  assert.match(summary, /ok: 2/);
+  assert.match(summary, /download_stalled: 1/);
+  assert.doesNotMatch(summary, /download_stalled: 2/);
+  assert.equal(jsonl(join(dir, "corpus.jsonl")).filter((r) => r.url.endsWith("/flaky.pdf")).length, 1);
+});
+
 test("an unpriced model yields no dollars and says so", async () => {
   const { costOf } = await import("../src/pricing.mjs");
   const tokens = { input: 1000, output: 1000, cache_read: 0, cache_write: 0 };

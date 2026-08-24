@@ -116,8 +116,12 @@ const diagnostics = (id, failed) => ({
 // expiring GitHub user token looks like to a campaign that outlives it.
 export function startStub({ pages = 7, failNth = 3, unauthorizedAfter = Infinity } = {}) {
   const pdf = makePdf(pages);
+  // Distinct byte counts so these three are not each other's duplicates.
+  const dribbled = makePdf(2);
+  const flakyPdf = makePdf(1);
   const sessions = new Map();
   let submissions = 0;
+  let flakyRequests = 0;
 
   const server = createServer(async (req, res) => {
     const path = new URL(req.url, "http://stub").pathname;
@@ -132,6 +136,26 @@ export function startStub({ pages = 7, failNth = 3, unauthorizedAfter = Infinity
     // An HTML sign-in page served as application/pdf — why prepare checks magic bytes.
     if (path === "/signin") return send(200, "<html>please sign in</html>", "application/pdf");
     if (path === "/missing") return send(404, "not found", "text/plain");
+
+    // The three shapes a real document server takes, which one flat deadline cannot
+    // tell apart. Headers and a few bytes, then silence forever — a hung transfer:
+    if (path === "/stall.pdf" || (path === "/flaky.pdf" && flakyRequests++ === 0)) {
+      res.writeHead(200, { "content-type": "application/pdf" });
+      res.write(pdf.subarray(0, 64));
+      return; // deliberately never ended
+    }
+    // ...the same host on a second attempt, working:
+    if (path === "/flaky.pdf") return send(200, flakyPdf, "application/pdf");
+    // ...and slow but always progressing, which must succeed however long it takes.
+    if (path === "/dribble.pdf") {
+      res.writeHead(200, { "content-type": "application/pdf" });
+      const step = Math.ceil(dribbled.length / 5);
+      for (let at = 0; at < dribbled.length; at += step) {
+        res.write(dribbled.subarray(at, at + step));
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      return res.end();
+    }
 
     if (path === "/v1/sessions" && req.method === "POST") {
       for await (const chunk of req) void chunk; // drain the multipart body

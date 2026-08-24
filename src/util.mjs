@@ -42,6 +42,20 @@ export function appendJsonl(path, obj) {
   appendFileSync(path, `${JSON.stringify(obj)}\n`);
 }
 
+// prepared.jsonl is append-only, so a URL re-attempted with `--retry` has more than one
+// attempt in it. Only the most recent one counts: otherwise a URL that failed the fetch
+// once and succeeded on retry is tallied as both a failure and a success, and appears
+// twice in the corpus. Keyed on `prepared_at` because every record one attempt writes —
+// the URL-level outcome and each of its chunk children — shares that single timestamp.
+export function latestAttempts(records) {
+  const newest = new Map();
+  for (const r of records) {
+    const at = r.prepared_at ?? "";
+    if (at > (newest.get(r.url) ?? "")) newest.set(r.url, at);
+  }
+  return records.filter((r) => (r.prepared_at ?? "") === newest.get(r.url));
+}
+
 // Never rejects: a non-zero exit is data, not an exception. Callers branch on
 // `code` because "this PDF is broken" is an expected outcome at corpus scale.
 export function exec(cmd, args, opts = {}) {

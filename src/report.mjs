@@ -32,7 +32,7 @@ import { readdirSync, readFileSync, existsSync, statSync, writeFileSync } from "
 import { join } from "node:path";
 import { runAxe, shape, AXE_VERSION } from "./lint.mjs";
 import { costOf, loadRates, normalizeModelId, provenance } from "./pricing.mjs";
-import { args, log, num, pct, readJsonl } from "./util.mjs";
+import { args, latestAttempts, log, num, pct, readJsonl } from "./util.mjs";
 
 const readJson = (p) => {
   try {
@@ -451,7 +451,7 @@ async function main() {
     process.exit(2);
   }
 
-  const prepared = readJsonl(a.prepared ?? "prepared.jsonl");
+  const prepared = latestAttempts(readJsonl(a.prepared ?? "prepared.jsonl"));
   log(`analyzing ${dirs.length} run(s)${opts.noLint ? "" : ` with a local axe re-lint (axe-core ${AXE_VERSION})`}`);
 
   // Serial on purpose. axe in jsdom is CPU-bound, and the point of this stage is a

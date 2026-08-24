@@ -121,7 +121,8 @@ error page costs one download here; discovering it during the run costs a sessio
 concurrency slot, and a place in the failure statistics.
 
 Each URL lands in `prepared.jsonl` with a class: `ok`, `duplicate`, `download_failed`,
-`too_large_bytes`, `not_pdf`, `pdfinfo_failed`, `encrypted`, `oversize_pages`, `prepare_error`.
+`download_stalled`, `download_timeout`, `tls_failed`, `too_large_bytes`, `not_pdf`,
+`pdfinfo_failed`, `encrypted`, `oversize_pages`, `prepare_error`.
 PDFs are detected by the `%PDF-` magic bytes, not by `content-type` — servers hand out PDFs as
 `application/octet-stream` and sign-in pages as `application/pdf`, and only one of those is
 visible from a header. The runnable subset is rewritten to `corpus.jsonl` on every pass.
@@ -139,7 +140,28 @@ announce itself reads as "we covered everything".
 | `--concurrency` | 8 | parallel downloads |
 | `--max-download-mb` | 200 | disk guard; larger files are recorded as skipped |
 | `--max-chunks` | 4 | cap-sized chunks per oversize PDF |
+| `--stall-sec` | 45 | give up after this long with **no bytes at all** |
+| `--total-sec` | 1800 | backstop for a server that dribbles forever |
+| `--retry` | | re-attempt URLs that failed the *fetch* (see below) |
 | `--limit` | | prepare only the first N new URLs |
+
+**Slow is not failed.** Document servers are slow — 35 MB at 40 KB/s is a fifteen-minute
+download that is working perfectly — so the stall clock is what detects failure, and it is
+re-armed on every chunk received. A single flat deadline cannot tell a hung transfer from a
+large one, and set short enough to catch the former it discards every big PDF on a slow host,
+biasing the corpus toward small files on fast servers.
+
+The four fetch classes (`download_failed`, `download_stalled`, `download_timeout`,
+`tls_failed`) say something about the transfer, not the document, and each is recoverable by
+changing a setting. `prepared.jsonl` is append-only and normally skips any URL already in it,
+so **`--retry` is what re-attempts those** — settled verdicts (`ok`, `not_pdf`, `encrypted`,
+`duplicate`, `too_large_bytes`) are left alone. Only a URL's most recent attempt is counted, by
+prepare and by the report.
+
+`tls_failed` usually means a host serving an incomplete certificate chain — something browsers
+paper over by fetching the missing intermediate and Node doesn't. Retry those with
+`node --use-system-ca src/prepare.mjs ...`, which widens trust to the OS store. It's opt-in
+rather than the default because widening a trust store shouldn't happen quietly.
 
 Nothing here hardcodes a page cap or an image ceiling — they come from `GET /v1/limits` at run
 time, which is the whole reason that endpoint exists. The one exception is the rasterization
