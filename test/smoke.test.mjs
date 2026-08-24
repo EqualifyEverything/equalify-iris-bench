@@ -132,10 +132,18 @@ test("prepare, run and report over a stub deployment", async (t) => {
   assert.equal(s.corpus.urls_covered, 0);
   assert.equal(s.end_to_end_rate, 0);
 
-  // Cost: both delivered runs' tokens, priced through the table, with the Bedrock
-  // partner caveat flagged on the model that produced them.
-  assert.equal(s.cost.tokens.input, 16400);
-  assert.equal(s.cost.tokens.output, 3800);
+  // Cost: ALL THREE runs' tokens, including the one that delivered nothing. A failed
+  // run has already paid for every page it extracted — on the first real bench, 73% of
+  // the bill was runs like this one — so a total drawn from delivered runs alone is the
+  // flattering number rather than the budget.
+  assert.equal(s.cost.tokens.input, 24600, "3 x 8200: the failed run's spend is in the total");
+  assert.equal(s.cost.tokens_delivered.input, 16400, "and separable, for comparing documents");
+  assert.equal(s.cost.tokens.output, 5700);
+  assert.ok(s.cost.usd_on_failures > 0, "and named, so the waste is visible rather than absorbed");
+  assert.ok(
+    s.cost.usd_per_delivered_page > s.cost.usd_per_page_p50,
+    "what a page cost is above what a page costs when nothing goes wrong",
+  );
   assert.equal(s.cost.unpriced_documents, 0);
   assert.equal(s.cost.rates.length, 1);
   assert.equal(s.cost.rates[0].normalized, "claude-sonnet-4-6");

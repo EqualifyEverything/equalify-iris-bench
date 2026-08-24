@@ -187,9 +187,18 @@ const defined = (rows, f) => rows.map(f).filter((v) => v != null);
 
 function summarize(rows, prepared, rates, opts) {
   const delivered = rows.filter((r) => r.outcome === "ready_for_review" || r.outcome === "closed");
+  // A run that fails still spends. Iris's own diagnostics report the tokens of a run
+  // that died in review after paying for every page, and on the first real bench those
+  // failures were 73% of the bill: $2.50 of delivered work inside $9.26 of spend. A
+  // cost baseline drawn from delivered runs alone is the flattering number, not the
+  // budget, so `usd_total` is every attempt and `usd_on_failures` says how much of it
+  // bought nothing.
+  const failed = rows.filter((r) => !delivered.includes(r));
   const walls = defined(delivered, (r) => r.wall_ms);
   const perPage = defined(delivered, (r) => r.ms_per_page);
   const usd = defined(delivered, (r) => r.usd);
+  const usdAll = defined(rows, (r) => r.usd);
+  const usdFailed = defined(failed, (r) => r.usd);
   const linted = delivered.filter((r) => r.final_lint);
   const lintable = linted.filter((r) => !r.final_lint.error);
 
@@ -218,9 +227,12 @@ function summarize(rows, prepared, rates, opts) {
   }
 
   // Which agent spends the money, and which one spends the time. Iris reports these
-  // per run; the campaign's question is which one to optimize first.
+  // per run; the campaign's question is which one to optimize first — and the answer
+  // is often visible only in the runs that failed, where one page agent burned 32,000
+  // output tokens over 8 minutes and took the other 24 pages down with it. So this is
+  // over every attempt, like the cost totals.
   const agents = {};
-  for (const r of delivered) {
+  for (const r of rows) {
     for (const [name, a] of Object.entries(r.by_agent ?? {})) {
       const cur = (agents[name] ??= { agent: name, calls: 0, total_ms: 0, input_tokens: 0, output_tokens: 0 });
       cur.calls += a.count;
@@ -292,23 +304,35 @@ function summarize(rows, prepared, rates, opts) {
     },
 
     cost: {
+      // Every attempt, delivered or not. See the note on `failed` above.
       tokens: {
+        input: sum(rows, (r) => r.tokens?.input),
+        output: sum(rows, (r) => r.tokens?.output),
+        cache_read: sum(rows, (r) => r.tokens?.cache_read),
+        cache_write: sum(rows, (r) => r.tokens?.cache_write),
+      },
+      tokens_delivered: {
         input: sum(delivered, (r) => r.tokens?.input),
         output: sum(delivered, (r) => r.tokens?.output),
-        cache_read: sum(delivered, (r) => r.tokens?.cache_read),
-        cache_write: sum(delivered, (r) => r.tokens?.cache_write),
       },
       tokens_per_page_p50: pct(defined(delivered, (r) => r.tokens_per_page), 50),
-      usd_total: usd.length ? usd.reduce((a, b) => a + b, 0) : null,
+      usd_total: usdAll.length ? usdAll.reduce((a, b) => a + b, 0) : null,
+      usd_on_failures: usdFailed.length ? usdFailed.reduce((a, b) => a + b, 0) : 0,
+      // The single number that predicts a campaign: everything spent, over the pages
+      // anyone actually received. Above `usd_per_page_p50` by whatever the failure rate
+      // costs — 3.7x on the first real bench.
+      usd_per_delivered_page:
+        usdAll.length && pagesDelivered ? usdAll.reduce((a, b) => a + b, 0) / pagesDelivered : null,
       usd_per_document: { p50: pct(usd, 50), p90: pct(usd, 90), max: pct(usd, 100) },
+      // Of a delivered document only: what a page costs when nothing goes wrong. Use
+      // `usd_per_delivered_page` for budgeting and this for comparing documents.
       usd_per_page_p50: pct(defined(delivered, (r) => r.usd_per_page), 50),
-      // Projected from the per-page median, which is the number to quote for "what
-      // would 100,000 pages cost" — and the number to distrust if unpriced > 0.
-      usd_per_1000_pages: pct(defined(delivered, (r) => r.usd_per_page), 50) * 1000 || null,
-      unpriced_documents: delivered.filter((r) => r.usd == null).length,
+      usd_per_1000_pages:
+        usdAll.length && pagesDelivered ? (usdAll.reduce((a, b) => a + b, 0) / pagesDelivered) * 1000 : null,
+      unpriced_documents: rows.filter((r) => r.tokens && r.usd == null).length,
       // Documents whose token sums cover only part of the run: their cost is a floor.
       partial_token_documents: partial,
-      rates: provenance(new Set(delivered.flatMap((r) => r.models)), rates),
+      rates: provenance(new Set(rows.flatMap((r) => r.models ?? [])), rates),
       caveat:
         "The deployment runs on Amazon Bedrock, which is partner-operated and billed by AWS at " +
         "AWS's own rates. Dollar figures here are estimates for comparing documents, not an invoice.",
@@ -389,9 +413,14 @@ function print(s) {
   l("--- cost (estimate; see caveat) ---");
   l(`  tokens: ${s.cost.tokens.input.toLocaleString()} in / ${s.cost.tokens.output.toLocaleString()} out`,
     `(cache ${s.cost.tokens.cache_read.toLocaleString()} read / ${s.cost.tokens.cache_write.toLocaleString()} write)`);
-  l(`  per document: p50 ${money(s.cost.usd_per_document.p50)}  p90 ${money(s.cost.usd_per_document.p90)}`);
-  l(`  per page: p50 ${money(s.cost.usd_per_page_p50)}  →  ${money(s.cost.usd_per_1000_pages)} per 1000 pages`);
-  l(`  total: ${money(s.cost.usd_total)}  (median ${s.cost.tokens_per_page_p50 ?? "n/a"} tokens/page)`);
+  l(`  per delivered document: p50 ${money(s.cost.usd_per_document.p50)}  p90 ${money(s.cost.usd_per_document.p90)}`);
+  l(`  per page, when it works: ${money(s.cost.usd_per_page_p50)}`);
+  l(`  per page ACTUALLY PAID (all spend / pages received): ${money(s.cost.usd_per_delivered_page)}`,
+    `→  ${money(s.cost.usd_per_1000_pages)} per 1000 pages`);
+  l(`  total: ${money(s.cost.usd_total)}  (median ${s.cost.tokens_per_page_p50 ?? "n/a"} tokens/page on delivered runs)`);
+  if (s.cost.usd_on_failures)
+    l(`  of which ${money(s.cost.usd_on_failures)} bought nothing —`,
+      `${rate(s.cost.usd_on_failures / s.cost.usd_total)} of spend went to runs that failed`);
   if (s.cost.unpriced_documents) l(`  WARNING: ${s.cost.unpriced_documents} document(s) ran on an unpriced model — cost excludes them`);
   if (s.cost.partial_token_documents) l(`  WARNING: ${s.cost.partial_token_documents} document(s) reported tokens for only part of the run — cost is a floor`);
   l("");
