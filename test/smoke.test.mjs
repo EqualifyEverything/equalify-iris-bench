@@ -228,7 +228,7 @@ test("a slow host is not a failed host, and a hung one is retryable", async (t) 
 
   // Without --retry a fetch failure is sticky, and says how to un-stick it.
   const second = await run("prepare.mjs", ["--csv", "urls.csv"], env, dir);
-  assert.match(second.stderr, /2 previously failed on the fetch, not on the document/);
+  assert.match(second.stderr, /2 previously failed on the fetch or the split/);
   assert.match(second.stderr, /0 to fetch/);
 
   // With it, only the fetch failures are re-attempted — the settled `ok` is not
@@ -247,6 +247,75 @@ test("a slow host is not a failed host, and a hung one is retryable", async (t) 
   assert.match(summary, /download_stalled: 1/);
   assert.doesNotMatch(summary, /download_stalled: 2/);
   assert.equal(jsonl(join(dir, "corpus.jsonl")).filter((r) => r.url.endsWith("/flaky.pdf")).length, 1);
+});
+
+test("a chunk too big to send is caught here, not by a 413", async (t) => {
+  // Real, and expensive: splitting the 1004-page Texas appropriations act with
+  // pdfseparate+pdfunite produced 477 MB chunks from a 34 MB source, because poppler
+  // copies the whole shared resource set into every slice. Each was uploaded and
+  // refused with a 413. A chunk's size is not a function of its page count, so it has
+  // to be measured — and measured here, where it costs a stat call.
+  const { base, origin, server } = await startStub({ pages: 7, maxRequestBytes: 900 });
+  t.after(() => server.close());
+  const dir = mkdtempSync(join(tmpdir(), "equalify-iris-bench-big-"));
+  const env = { IRIS_BASE_URL: base, IRIS_TOKEN: "stub-token" };
+  writeFileSync(join(dir, "urls.csv"), `pdf_url\n${origin}/a.pdf\n`);
+
+  const prep = await run("prepare.mjs", ["--csv", "urls.csv"], env, dir);
+  assert.equal(prep.code, 0, prep.stderr);
+
+  // Per chunk, not per document: the two 3-page slices exceed the cap and the trailing
+  // 1-page slice does not, so one of the three is still runnable. A guard that judged
+  // the whole document would have thrown that page away too.
+  const rows = jsonl(join(dir, "prepared.jsonl"));
+  const big = rows.filter((r) => r.klass === "chunk_too_large");
+  assert.equal(big.length, 2);
+  assert.ok(big[0].bytes > 900, "the measured size is kept, not just the verdict");
+  assert.match(big[0].error, /max_request_bytes/);
+  assert.match(big[0].error, /\d+ bytes >/, "the sizes are readable, not rounded to '0.0 MB'");
+  // The qpdf advice is only true when poppler did the splitting, so it is asserted
+  // against whichever splitter this machine actually has.
+  if (big[0].split_with === "qpdf") {
+    assert.doesNotMatch(big[0].error, /install qpdf/, "no advice to install what is already in use");
+  } else {
+    assert.match(big[0].error, /install qpdf/, "says the fix, since the splitter is the cause");
+  }
+  assert.deepEqual(
+    big.map((r) => [r.page_from, r.page_to]),
+    [
+      [1, 3],
+      [4, 6],
+    ],
+    "and exactly which pages are missing as a result",
+  );
+
+  // Not runnable, and not silently absent either: the parent counts them and the
+  // summary says so, because a corpus quietly missing a document reads as coverage.
+  const corpus = jsonl(join(dir, "corpus.jsonl"));
+  assert.deepEqual(corpus.map((r) => r.page_from), [7]);
+  assert.equal(rows.find((r) => r.klass === "oversize_pages").chunks_too_large, 2);
+  assert.match(prep.stderr, /NOT runnable: 2 chunk\(s\) came out over max_request_bytes/);
+
+  // Retryable, because the fix is on this side: installing qpdf changes the outcome
+  // for a document that was never at fault.
+  const again = await run("prepare.mjs", ["--csv", "urls.csv"], env, dir);
+  assert.match(again.stderr, /1 previously failed on the fetch or the split/);
+  assert.match(again.stderr, /re-splits from scratch/);
+});
+
+test("a structured error survives into text", async () => {
+  const { errorText } = await import("../src/util.mjs");
+  // Iris returns {code, message, details}. Interpolated directly it becomes
+  // "[object Object]" — which is what a real 413 printed, hiding a message that named
+  // the declared size, the cap and the fix. It would also have collapsed every
+  // distinct structured failure into one bogus class in the report.
+  assert.equal(
+    errorText({ code: "upload_too_large", message: "Upload too large: 455.4 MB", details: { max_bytes: 1 } }),
+    "upload_too_large: Upload too large: 455.4 MB",
+  );
+  assert.equal(errorText("already a string"), "already a string");
+  assert.equal(errorText(null), null);
+  assert.equal(errorText({ weird: true }), '{"weird":true}', "no shape is rendered as [object Object]");
 });
 
 test("an unpriced model yields no dollars and says so", async () => {

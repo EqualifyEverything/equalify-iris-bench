@@ -18,7 +18,7 @@
 import { basename, join } from "node:path";
 import { readFileSync, writeFileSync } from "node:fs";
 import { fetchLimits } from "./limits.mjs";
-import { appendJsonl, args, ensureDir, log, num, pool, readJsonl, sleep } from "./util.mjs";
+import { appendJsonl, args, ensureDir, errorText, log, num, pool, readJsonl, sleep } from "./util.mjs";
 
 const TERMINAL = new Set(["ready_for_review", "closed", "failed"]);
 
@@ -249,7 +249,7 @@ async function main() {
       meta = { id: doc.id, url: doc.url, outcome: "harness_error", error: `${e.name}: ${e.message}` };
     }
     if (meta.outcome === "http_401" || meta.outcome === "http_403") {
-      abort ??= `${meta.outcome} on submit — the token was refused: ${String(meta.error).slice(0, 200)}`;
+      abort ??= `${meta.outcome} on submit — the token was refused: ${(errorText(meta.error) ?? "").slice(0, 200)}`;
       return;
     }
     appendJsonl(ledgerPath, {
@@ -267,7 +267,7 @@ async function main() {
     log(
       `[${n}/${todo.length}] ${label} ${meta.outcome}` +
         `${meta.round_trip_ms ? ` in ${Math.round(meta.round_trip_ms / 1000)}s` : ""}` +
-        `${meta.error ? ` — ${String(meta.error).slice(0, 120)}` : ""}`,
+        `${meta.error ? ` — ${(errorText(meta.error) ?? "").slice(0, 160)}` : ""}`,
     );
   });
 

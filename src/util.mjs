@@ -42,6 +42,18 @@ export function appendJsonl(path, obj) {
   appendFileSync(path, `${JSON.stringify(obj)}\n`);
 }
 
+// Iris's errors are structured — `{code, message, details}` — and the good ones say
+// exactly what was wrong and what to do about it. Interpolated into a string they arrive
+// as "[object Object]", which hides the one sentence that would have explained the
+// failure, and makes every distinct structured error group into a single useless class.
+// The structured form is what gets stored; this is for reading and grouping.
+export function errorText(err) {
+  if (err == null) return null;
+  if (typeof err === "string") return err;
+  if (typeof err.message === "string") return err.code ? `${err.code}: ${err.message}` : err.message;
+  return JSON.stringify(err);
+}
+
 // prepared.jsonl is append-only, so a URL re-attempted with `--retry` has more than one
 // attempt in it. Only the most recent one counts: otherwise a URL that failed the fetch
 // once and succeeded on retry is tallied as both a failure and a success, and appears

@@ -55,14 +55,14 @@ export const OUTPUT_HTML = `<!DOCTYPE html><html><head><title>Fixture</title></h
 <img src="fig.png">
 </body></html>`;
 
-const LIMITS = {
+const limitsFor = (maxRequestBytes) => ({
   pdf: { max_pages: 3 },
-  upload: { max_files: 25, max_request_bytes: 134217728 },
+  upload: { max_files: 25, max_request_bytes: maxRequestBytes },
   image: { max_bytes: 3932160, max_long_edge_px: 1568, max_dimension_px: 8000 },
   // High enough that the submit spacing does not dominate the test's runtime, while
   // still exercising the code path that derives spacing from the published limit.
   rate_limits: { general_per_minute: 240, auth_per_minute: 60, upload_per_minute: 600 },
-};
+});
 
 const MODEL = "us.anthropic.claude-sonnet-4-6";
 const call = (agent, capability, duration_ms, input_tokens, output_tokens) => ({
@@ -114,7 +114,15 @@ const diagnostics = (id, failed) => ({
 // capture path that matters most: a run whose only account of itself is its log.
 // `unauthorizedAfter` starts refusing submissions partway through, which is what an
 // expiring GitHub user token looks like to a campaign that outlives it.
-export function startStub({ pages = 7, failNth = 3, unauthorizedAfter = Infinity } = {}) {
+export function startStub({
+  pages = 7,
+  failNth = 3,
+  unauthorizedAfter = Infinity,
+  // Tiny in the one test that needs a chunk to come out unsendable — the real cap is
+  // 128 MB, which no fixture is going to reach.
+  maxRequestBytes = 134217728,
+} = {}) {
+  const LIMITS = limitsFor(maxRequestBytes);
   const pdf = makePdf(pages);
   // Distinct byte counts so these three are not each other's duplicates.
   const dribbled = makePdf(2);

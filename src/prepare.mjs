@@ -19,7 +19,7 @@
 // skipped on a later pass, and downloads are content-addressed in cache/.
 
 import { join, resolve } from "node:path";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { fetchLimits, pxFromPts, RASTER_DPI } from "./limits.mjs";
 import {
   appendJsonl,
@@ -321,6 +321,17 @@ async function splitRange(tool, src, from, to, dest, tmpDir) {
 // (not_pdf, encrypted, duplicate, too_large_bytes, ok) alone.
 const RETRYABLE = new Set(["download_failed", "download_stalled", "download_timeout", "tls_failed", "prepare_error"]);
 
+// A split that produced unusable chunks is retryable for the same reason: the fix is
+// on this side (install qpdf, whose subsetting is what keeps a slice small) and the
+// document was never at fault. Retrying re-splits from scratch rather than trusting
+// the chunks the old splitter left behind.
+// Bytes below a megabyte, megabytes above it. A cap breach reported as "0.0 MB > 0 MB"
+// is not a measurement.
+const size = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${n} bytes`);
+
+const isRetryable = (r) =>
+  r != null && (RETRYABLE.has(r.klass) || (r.klass === "oversize_pages" && (r.chunks_too_large > 0 || r.split_error)));
+
 // --- main ------------------------------------------------------------------
 
 async function main() {
@@ -367,12 +378,13 @@ async function main() {
   // The URL-level outcome of each past attempt — chunk children carry their parent's
   // URL, so they are not it.
   const done = new Map(previous.filter((r) => !r.parent_sha).map((r) => [r.url, r]));
-  const retryable = urls.filter((u) => RETRYABLE.has(done.get(u)?.klass));
-  let todo = urls.filter((u) => !done.has(u) || (a.retry && RETRYABLE.has(done.get(u).klass)));
+  const retryable = urls.filter((u) => isRetryable(done.get(u)));
+  let todo = urls.filter((u) => !done.has(u) || (a.retry && isRetryable(done.get(u))));
   if (a.limit) todo = todo.slice(0, num(a.limit, todo.length));
   log(`csv: ${urls.length} unique URL(s); ${done.size} already prepared; ${todo.length} to fetch`);
   if (retryable.length && !a.retry) {
-    log(`  ${retryable.length} previously failed on the fetch, not on the document — --retry re-attempts those`);
+    log(`  ${retryable.length} previously failed on the fetch or the split, not on the document —`);
+    log("     --retry re-attempts those (and re-splits from scratch)");
   }
 
   // sha256 -> url, so the same file behind two URLs is downloaded twice (cheap,
@@ -382,6 +394,7 @@ async function main() {
 
   let n = 0;
   await pool(todo, concurrency, async (url) => {
+    const isRetry = done.has(url);
     const record = { url, prepared_at: new Date().toISOString() };
     try {
       const dl = await download(url, maxBytes, timeouts);
@@ -428,6 +441,16 @@ async function main() {
       }
 
       if (info.pages <= limits.maxPages) {
+        // Within the page cap but still unsendable: the request cap is on bytes, and
+        // the two limits are independent.
+        if (limits.maxRequestBytes && dl.bytes > limits.maxRequestBytes) {
+          appendJsonl(preparedPath, {
+            ...record,
+            klass: "too_large_bytes",
+            error: `${size(dl.bytes)} > max_request_bytes (${size(limits.maxRequestBytes)})`,
+          });
+          return;
+        }
         appendJsonl(preparedPath, { ...record, klass: "ok", id: sha, path, risks });
         return;
       }
@@ -440,18 +463,49 @@ async function main() {
       const wanted = Math.ceil(info.pages / limits.maxPages);
       const made = [];
       let failure = null;
+      let tooLarge = 0;
       for (let c = 0; c < Math.min(wanted, maxChunks); c++) {
         const from = c * limits.maxPages + 1;
         const to = Math.min(info.pages, from + limits.maxPages - 1);
         const id = `${sha}-p${from}-${to}`;
         const dest = join(chunkDir, `${id}.pdf`);
         const tmp = ensureDir(join(chunkDir, `.tmp-${id}`));
-        const err = existsSync(dest) ? null : await splitRange(tool, path, from, to, dest, tmp);
+        // A retried URL re-splits from scratch. Skipping existing chunks makes an
+        // ordinary resume cheap, but on a retry the existing chunks are precisely what
+        // is suspect — they may be the output of a splitter that has since been fixed.
+        const err = existsSync(dest) && !isRetry ? null : await splitRange(tool, path, from, to, dest, tmp);
         if (err) {
           failure = err;
           break;
         }
-        made.push({ id, from, to, path: dest, pages: to - from + 1 });
+        // How big the chunk actually came out, which is not a function of the page
+        // count. pdfseparate+pdfunite copies the source's whole shared resource set
+        // into every slice: a 25-page cut of a 1004-page, 34 MB act came out at 477 MB
+        // and was refused with a 413 after being uploaded. qpdf subsets properly.
+        // Measured here so an unsendable chunk costs a stat call, not a failed session.
+        const bytes = statSync(dest).size;
+        if (limits.maxRequestBytes && bytes > limits.maxRequestBytes) {
+          tooLarge++;
+          appendJsonl(preparedPath, {
+            url,
+            prepared_at: record.prepared_at,
+            klass: "chunk_too_large",
+            id,
+            path: dest,
+            sha256: sha,
+            parent_sha: sha,
+            page_from: from,
+            page_to: to,
+            pages: to - from + 1,
+            bytes,
+            split_with: tool,
+            error:
+              `chunk is ${size(bytes)} > max_request_bytes (${size(limits.maxRequestBytes)})` +
+              (tool === "qpdf" ? "" : " — install qpdf, which subsets shared resources instead of copying them"),
+          });
+          continue;
+        }
+        made.push({ id, from, to, path: dest, pages: to - from + 1, bytes });
       }
       appendJsonl(preparedPath, {
         ...record,
@@ -459,7 +513,8 @@ async function main() {
         risks,
         split_with: tool,
         chunks: made.length,
-        chunks_dropped: Math.max(0, wanted - made.length),
+        chunks_dropped: Math.max(0, wanted - made.length - tooLarge),
+        chunks_too_large: tooLarge,
         split_error: failure,
       });
       for (const c of made) {
@@ -475,7 +530,7 @@ async function main() {
           page_from: c.from,
           page_to: c.to,
           pages: c.pages,
-          bytes: null,
+          bytes: c.bytes,
           risks,
         });
       }
@@ -504,6 +559,13 @@ async function main() {
   for (const [k, v] of Object.entries(counts).sort((x, y) => y[1] - x[1])) log(`  ${k}: ${v}`);
   log(`  runnable: ${runnable.length} session(s), ${pages} page(s) — ${chunked} of them chunks of oversize PDFs`);
   if (droppedChunks) log(`  NOT covered: ${droppedChunks} chunk(s) past --max-chunks=${maxChunks}`);
+  if (counts.chunk_too_large) {
+    log(`  NOT runnable: ${counts.chunk_too_large} chunk(s) came out over max_request_bytes`);
+    if (tool !== "qpdf") {
+      log("     Splitting with poppler copies the source's shared resources into every slice.");
+      log("     Install qpdf and re-run with --retry: it subsets them instead.");
+    }
+  }
   if (atRisk) log(`  ${atRisk} runnable item(s) carry a predicted-rejection risk flag (see .risks)`);
   // These three are recoverable by re-running with different settings, and a corpus
   // that lost documents to a trust store or a slow host is not the corpus that was

@@ -32,7 +32,7 @@ import { readdirSync, readFileSync, existsSync, statSync, writeFileSync } from "
 import { join } from "node:path";
 import { runAxe, shape, AXE_VERSION } from "./lint.mjs";
 import { costOf, loadRates, normalizeModelId, provenance } from "./pricing.mjs";
-import { args, latestAttempts, log, num, pct, readJsonl } from "./util.mjs";
+import { args, errorText, latestAttempts, log, num, pct, readJsonl } from "./util.mjs";
 
 const readJson = (p) => {
   try {
@@ -160,7 +160,7 @@ async function analyze(dir, rates, opts) {
     structure,
 
     // --- what went wrong ---
-    error: failed?.error ?? meta.error ?? status?.error ?? null,
+    error: errorText(failed?.error ?? meta.error ?? status?.error) ?? null,
     errors: (diag?.errors ?? []).map((e) => e.message),
     // Every run that files one of these opens a GitHub issue on the upstream repo.
     // Counted so the campaign can see what it generated.
