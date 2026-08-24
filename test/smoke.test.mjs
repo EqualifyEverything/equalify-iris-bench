@@ -13,7 +13,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtempSync, readFileSync, readdirSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -236,7 +236,7 @@ test("a slow host is not a failed host, and a hung one is retryable", async (t) 
 
   // Without --retry a fetch failure is sticky, and says how to un-stick it.
   const second = await run("prepare.mjs", ["--csv", "urls.csv"], env, dir);
-  assert.match(second.stderr, /2 previously failed on the fetch or the split/);
+  assert.match(second.stderr, /2 previously failed on the fetch or the split, or lost/);
   assert.match(second.stderr, /0 to fetch/);
 
   // With it, only the fetch failures are re-attempted — the settled `ok` is not
@@ -320,8 +320,35 @@ test("a chunk too big to send is caught here, not by a 413", async (t) => {
   // Retryable, because the fix is on this side: installing qpdf changes the outcome
   // for a document that was never at fault.
   const again = await run("prepare.mjs", ["--csv", "urls.csv"], env, dir);
-  assert.match(again.stderr, /1 previously failed on the fetch or the split/);
+  assert.match(again.stderr, /1 previously failed on the fetch or the split, or lost/);
   assert.match(again.stderr, /re-splits from scratch/);
+});
+
+test("a prepared file that is gone is not a corpus entry", async (t) => {
+  // The cache is gigabytes and gets pruned — deliberately, when a splitter's output
+  // turns out to be unsendable, and eventually just for space. prepared.jsonl says `ok`
+  // either way, so without this the corpus lists paths nothing can open and the run
+  // stage discovers it one failed item at a time.
+  const { base, origin, server } = await startStub({ pages: 7 });
+  t.after(() => server.close());
+  const dir = mkdtempSync(join(tmpdir(), "equalify-iris-bench-gone-"));
+  const env = { IRIS_BASE_URL: base, IRIS_TOKEN: "stub-token" };
+  writeFileSync(join(dir, "urls.csv"), `pdf_url\n${origin}/a.pdf\n`);
+
+  assert.equal((await run("prepare.mjs", ["--csv", "urls.csv"], env, dir)).code, 0);
+  assert.equal(jsonl(join(dir, "corpus.jsonl")).length, 3);
+
+  rmSync(jsonl(join(dir, "corpus.jsonl"))[1].path);
+  const after = await run("prepare.mjs", ["--csv", "urls.csv"], env, dir);
+  assert.equal(jsonl(join(dir, "corpus.jsonl")).length, 2, "the missing chunk is not offered to the run stage");
+  assert.match(after.stderr, /1 prepared file\(s\) are no longer on disk, from 1 URL\(s\)/);
+  assert.match(after.stderr, /--retry to fetch and split them again/);
+
+  // And --retry actually does it, even though the URL's own outcome was never a failure.
+  const retried = await run("prepare.mjs", ["--csv", "urls.csv", "--retry"], env, dir);
+  assert.match(retried.stderr, /1 to fetch/);
+  assert.equal(jsonl(join(dir, "corpus.jsonl")).length, 3, "and all three pages are runnable again");
+  assert.doesNotMatch(retried.stderr, /no longer on disk/);
 });
 
 test("a structured error survives into text", async () => {

@@ -393,12 +393,17 @@ async function main() {
   // The URL-level outcome of each past attempt — chunk children carry their parent's
   // URL, so they are not it.
   const done = new Map(previous.filter((r) => !r.parent_sha).map((r) => [r.url, r]));
-  const retryable = urls.filter((u) => isRetryable(done.get(u)));
-  let todo = urls.filter((u) => !done.has(u) || (a.retry && isRetryable(done.get(u))));
+  // A URL whose prepared file has since been deleted is retryable for the same reason a
+  // bad split is: the document was never at fault and re-running fixes it. The cache is
+  // gigabytes, so this is an ordinary state, not a corrupt one.
+  const gone = new Set(previous.filter((r) => r.klass === "ok" && r.path && !existsSync(r.path)).map((r) => r.url));
+  const recoverable = (u) => isRetryable(done.get(u)) || gone.has(u);
+  const retryable = urls.filter(recoverable);
+  let todo = urls.filter((u) => !done.has(u) || (a.retry && recoverable(u)));
   if (a.limit) todo = todo.slice(0, num(a.limit, todo.length));
   log(`csv: ${urls.length} unique URL(s); ${done.size} already prepared; ${todo.length} to fetch`);
   if (retryable.length && !a.retry) {
-    log(`  ${retryable.length} previously failed on the fetch or the split, not on the document —`);
+    log(`  ${retryable.length} previously failed on the fetch or the split, or lost their prepared file —`);
     log("     --retry re-attempts those (and re-splits from scratch)");
   }
 
@@ -569,7 +574,12 @@ async function main() {
   // corpus.jsonl is the runnable subset, rewritten from scratch each pass so it is
   // a deterministic function of prepared.jsonl rather than an append-only history.
   const all = latestAttempts(readJsonl(preparedPath));
-  const runnable = all.filter((r) => r.klass === "ok");
+  // An `ok` record is a claim about a file, and the file can be gone: the cache is
+  // gigabytes and gets pruned. A corpus that lists a path nothing can open sends the
+  // run stage off to fail one item at a time, so the claim is checked here — where the
+  // remedy is to re-run prepare, and where saying so costs a stat call.
+  const missing = all.filter((r) => r.klass === "ok" && r.path && !existsSync(r.path));
+  const runnable = all.filter((r) => r.klass === "ok" && !missing.includes(r));
   runnable.sort((x, y) => (x.id < y.id ? -1 : x.id > y.id ? 1 : 0)); // stable staging order
   writeFileSync(corpusPath, runnable.map((r) => JSON.stringify(r)).join("\n") + (runnable.length ? "\n" : ""));
 
@@ -583,6 +593,11 @@ async function main() {
   log("--- corpus ---");
   for (const [k, v] of Object.entries(counts).sort((x, y) => y[1] - x[1])) log(`  ${k}: ${v}`);
   log(`  runnable: ${runnable.length} session(s), ${pages} page(s) — ${chunked} of them chunks of oversize PDFs`);
+  if (missing.length) {
+    const urls = new Set(missing.map((r) => r.url));
+    log(`  NOT runnable: ${missing.length} prepared file(s) are no longer on disk, from ${urls.size} URL(s).`);
+    log(`     Re-run with --retry to fetch and split them again.`);
+  }
   if (droppedChunks) log(`  NOT covered: ${droppedChunks} chunk(s) past --max-chunks=${maxChunks}`);
   if (counts.chunk_too_large) {
     log(`  NOT runnable: ${counts.chunk_too_large} chunk(s) came out over max_request_bytes`);
