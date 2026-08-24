@@ -69,9 +69,9 @@ npm test                        # proves the harness works: no token, no network
 ```
 
 ```sh
-cp .env.example .env            # then set IRIS_BASE_URL if not the UIC deployment
-node src/login.mjs              # opens a code to approve in the browser; prints a token
-                                # paste it into .env as IRIS_TOKEN
+cp .env.example .env                  # then set IRIS_BASE_URL if not the UIC deployment
+node src/login.mjs --write-env .env    # approve a code in the browser; fills in IRIS_TOKEN
+                                       # omit --write-env to print the token instead
 ```
 
 Start with a handful of URLs, not the whole list. Ten is enough to prove the loop end to end
